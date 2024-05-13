@@ -60,7 +60,7 @@ function generateMarkdown(completionObject) {
         md += '_No Suffix Provided_\n';
     else
         md += `Suffix:\n${cb}${lang}\n${suffix}\n${cb}\n`;
-    
+
     md += "## Completion Object\n\n";
     md += `${cb}json\n${JSON.stringify(completionObject,null,2)}\n${cb}`
 
@@ -68,12 +68,13 @@ function generateMarkdown(completionObject) {
 }
 
 function forward(srcRequest,srcResponse) {
+    const start = performance.now()
 
     function onResponse(dstResponse) {
         log.info("Response received from Copilot.")
         log.info(`Status Code: ${dstResponse.statusCode}`);
         log.info(`Response Headers: ${JSON.stringify(dstResponse.headers)}`);
-      
+
         srcResponse.writeHead(200, dstResponse.headers); // forward response headers back to source
 
         let data = '';  // accumulate the response in this variable
@@ -82,12 +83,18 @@ function forward(srcRequest,srcResponse) {
             log.error("Error connecting to Copilot, ", e);
         });
 
+        let firstDataTimestamp = null
         dstResponse.on('data', function(chunk) {
+            if (!firstDataTimestamp) {
+                firstDataTimestamp = performance.now()
+            }
             srcResponse.write(chunk); // send back the chunks as they are received
             data += chunk;     // accumulate the chunks for processing
         });
 
+        let endTimestamp = null
         dstResponse.on('end', function() {
+            endTimestamp = performance.now()
             // data is in the form of a list of event-stream strings of the form
             // data: {json payload}  or data: [DONE]
             const messages = data.split('\n\n');
@@ -106,14 +113,14 @@ function forward(srcRequest,srcResponse) {
                             choices[key] += choiceObject.text
                         }
                     }
-                }                
+                }
             }
 
             // The choices dictionary will contain each choice with a unique key
             // convert to an array of choices
             choiceArray = [];
             for (let k in choices) {
-                choiceArray.push(choices[k]);
+                choiceArray.push(choices[k])
             }
 
             const completionid = uuidv4()
@@ -124,16 +131,19 @@ function forward(srcRequest,srcResponse) {
                 "completionid": completionid,
                 //"requestHeaders": srcRequest.headers, // don't log the authorization header
                 "request": srcRequest.body,
-                "responseHeaders": dstResponse.headers, 
+                "responseHeaders": dstResponse.headers,
                 "response": choiceArray,
+                "timeToFirstData": firstDataTimestamp - start,
+                "timeToEnd": endTimestamp - start,
+                "multiline": !srcRequest.body.stop.includes('\n')
             }
-            
+
             let fname = path.join(args.data,`${timestamp}-${completionid}.json`);
             log.info("Logging completion file: ${fname}.");
             fs.writeFile(fname, JSON.stringify(completionObject,null,2), (err) => {
                 if (err) log.error('Completion file could not be written, ', err);
               });
-            
+
             srcResponse.end(); // close out the response to the source
         });
     }
@@ -167,13 +177,76 @@ app.get('/', (req, res) => {
         log.error(err);
         res.status(500).send('Internal server error');
       } else {
+        const data/*: {
+            multiline:boolean,
+            timeToFirstData:number,
+            timeToEnd: number,
+            openAiProcessingTime: number
+        }[]*/ = []
+
+        files.forEach(file => {
+            const fname = path.join(args.data, file)
+            const content = fs.readFileSync(fname, 'utf8');
+            const json = JSON.parse(content.toString())
+
+            data.push({
+                multiline: json.multiline,
+                timeToFirstData: json.timeToFirstData,
+                timeToEnd: json.timeToEnd,
+                openAiProcessingTime: Number.parseFloat(json.responseHeaders["openai-processing-ms"]??0)
+            })
+        })
+
+        function p50(arr) {
+            const sorted = arr.sort((a,b) => a<b?-1:1);
+            return sorted[Math.floor(sorted.length/2)];
+        }
+        function p75(arr) {
+            const sorted = arr.sort((a,b) => a<b?-1:1);
+            return sorted[Math.floor(sorted.length*0.75)];
+        }
+        function average(arr) {
+            return arr.reduce((a,b) => a+b, 0) / arr.length;
+        }
+
+        const multilineData = data.filter(d => d.multiline);
+        const nonMultilineData = data.filter(d => !d.multiline);
+
+        const summary = `
+        <p>${data.length} requests</p>
+        <table>
+            <thead>
+                <tr>
+                    <th>Multiline</th>
+                    <th>P50</th>
+                    <th>P75</th>
+                    <th>Average</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>true</td>
+                    <td>${p50(multilineData.map(d => d.timeToEnd))}</td>
+                    <td>${p75(multilineData.map(d => d.timeToEnd))}</td>
+                    <td>${average(multilineData.map(d => d.timeToEnd))}</td>
+                </tr>
+                <tr>
+                    <td>false</td>
+                    <td>${p50(nonMultilineData.map(d => d.timeToEnd))}</td>
+                    <td>${p75(nonMultilineData.map(d => d.timeToEnd))}</td>
+                    <td>${average(nonMultilineData.map(d => d.timeToEnd))}</td>
+                </tr>
+            </tbody>
+        </table>
+        `
+
         const sortedFiles = files.sort((a,b) => b<a?-1:1);
         const links = sortedFiles.map(file => `<a href="/view/${file}">${file}</a>`).join('<br>');
-        const html = `<html><title>Copilot Completions</title><body><h1>Copilot Completions</h1><p>Newest On Top.  Reload to Refresh.</p>${links}</body></html>`;
+        const html = `<html><title>Copilot Completions</title><body><h1>Copilot Completions</h1><p>Newest On Top.  Reload to Refresh.</p>${summary}${links}</body></html>`;
         res.send(html);
       }
     });
-  }); 
+  });
 
 // handle routes
 app.get('/view/:name', (req, res) => {
@@ -203,7 +276,7 @@ app.get('/view/:name', (req, res) => {
 app.post('/v1/engines/copilot-codex/completions', (srcRequest, srcResponse) => {
     log.info('Incoming Completion Request on /v1/engines/copilot-codex/completions')
 
-    forward(srcRequest,srcResponse);
+    forward(srcRequest, srcResponse);
 });
 
 // Handle command line args
